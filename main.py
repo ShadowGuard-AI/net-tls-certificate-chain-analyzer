@@ -64,6 +64,10 @@ def get_certificate_chain(hostname, port=443, verify=True):
         context = SSL.Context(SSL.TLS_CLIENT_METHOD)
         if verify:
             context.set_default_verify_paths()
+            # The callback returns ok unchanged, so verification stands or falls
+            # on the library verdict for each depth. Nothing in the analysis below
+            # rechecks chain building; a chain the library rejected still fails
+            # the handshake before I ever see it, under verify.
             context.set_verify(SSL.VERIFY_PEER, lambda conn, cert, errno, depth, ok: ok)
         else:
             context.set_verify(SSL.VERIFY_NONE, lambda conn, cert, errno, depth, ok: True)
@@ -91,6 +95,10 @@ def get_certificate_chain(hostname, port=443, verify=True):
     except socket.gaierror as e:
         logging.error(f"Socket error: Could not resolve hostname {hostname}: {e}")
         return None
+    # This branch rarely fires. pyOpenSSL raises its own SSL error type,
+    # not the stdlib ssl.SSLError named here, so most handshake and
+    # verification failures land in the generic handler below with a
+    # vaguer message.
     except ssl.SSLError as e:
         logging.error(f"SSL error: {e}")
         return None
@@ -133,6 +141,9 @@ def analyze_certificate_chain(cert_chain):
         # Validity check
         not_before = datetime.strptime(cert.get_notBefore().decode('utf-8'), '%Y%m%d%H%M%SZ')
         not_after = datetime.strptime(cert.get_notAfter().decode('utf-8'), '%Y%m%d%H%M%SZ')
+        # Both sides of this comparison are naive UTC values: the certificate
+        # stamps end in Z and utcnow matches them. The host timezone never
+        # enters into it, which is the only reason no tzinfo handling exists.
         now = datetime.utcnow()
 
         print(f"  Valid From: {not_before}")
@@ -146,6 +157,9 @@ def analyze_certificate_chain(cert_chain):
             print("  Status: Valid")
 
         # Check for self-signed certificates (root CA)
+        # A root that a server includes in its chain earns this same note as
+        # a self signed leaf. Comparing the two name objects tells me the
+        # shape, not which position in the chain I am looking at.
         if subject == issuer:
             print("  Note: Self-signed certificate (Root CA)")
 
@@ -154,6 +168,10 @@ def analyze_certificate_chain(cert_chain):
     # Check for missing intermediates
     if len(cert_chain) > 1:
         for i in range(len(cert_chain) - 1):
+            # I compare neighbours in the order the server presented them and
+            # stop at the first mismatch. A complete chain sent out of order is
+            # reported as a missing intermediate, because I never sort the chain
+            # or try to build the path myself.
             if cert_chain[i].get_issuer() != cert_chain[i+1].get_subject():
                 logging.warning("Potential missing intermediate certificate!")
                 break
