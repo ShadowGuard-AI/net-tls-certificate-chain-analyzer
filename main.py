@@ -2,8 +2,8 @@ import socket
 import ssl
 import argparse
 import logging
-import requests
-from OpenSSL import crypto
+import sys
+from OpenSSL import SSL
 from datetime import datetime
 
 # Configure logging
@@ -52,38 +52,41 @@ def get_certificate_chain(hostname, port=443, verify=True):
         list: A list of OpenSSL.crypto.X509 objects representing the certificate chain,
               or None if an error occurred.
     """
+    connection = None
     try:
         # Create a socket
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(10)  # Set a timeout to prevent hanging
 
-        # Wrap the socket with SSL/TLS
-        context = ssl.create_default_context()
-        if not verify:
-            context.check_hostname = False
-            context.verify_mode = ssl.CERT_NONE
-        
-        wrapped_socket = context.wrap_socket(sock, server_hostname=hostname)
+        # Build a pyOpenSSL context. pyOpenSSL is the package this
+        # tool already depends on, and its connection object is the
+        # one that can return the full chain the server presents.
+        context = SSL.Context(SSL.TLS_CLIENT_METHOD)
+        if verify:
+            context.set_default_verify_paths()
+            context.set_verify(SSL.VERIFY_PEER, lambda conn, cert, errno, depth, ok: ok)
+        else:
+            context.set_verify(SSL.VERIFY_NONE, lambda conn, cert, errno, depth, ok: True)
 
-        # Connect to the server
-        wrapped_socket.connect((hostname, port))
+        connection = SSL.Connection(context, sock)
+        connection.set_connect_state()
+        try:
+            connection.set_tlsext_host_name(hostname.encode("utf-8"))
+        except Exception:
+            pass  # SNI is best effort for IP address targets.
 
-        # Get the certificate chain
-        cert_chain = wrapped_socket.getpeercert(binary_form=True)
-        wrapped_socket.close()
+        # Connect to the server and complete the handshake
+        connection.connect((hostname, port))
+
+        # Get the presented certificate chain: leaf first, then any
+        # intermediates the server sent, as X509 objects.
+        cert_chain = connection.get_peer_cert_chain()
 
         if not cert_chain:
             logging.error("No certificate chain received.")
             return None
-        
-        # Convert the certificate chain from binary to X509 objects
-        x509_chain = []
-        for cert in ssl.get_server_certificate((hostname, port), cert_chain=cert_chain).split('-----END CERTIFICATE-----\n'):
-            if cert:
-                x509_chain.append(crypto.load_certificate(crypto.FILETYPE_PEM, cert + '-----END CERTIFICATE-----\n'))
 
-
-        return x509_chain
+        return list(cert_chain)
 
     except socket.gaierror as e:
         logging.error(f"Socket error: Could not resolve hostname {hostname}: {e}")
@@ -97,6 +100,12 @@ def get_certificate_chain(hostname, port=443, verify=True):
     except Exception as e:
         logging.error(f"An unexpected error occurred: {e}")
         return None
+    finally:
+        if connection is not None:
+            try:
+                connection.close()
+            except Exception:
+                pass
 
 
 def analyze_certificate_chain(cert_chain):
@@ -171,6 +180,7 @@ def main():
         analyze_certificate_chain(cert_chain)
     else:
         logging.error("Failed to retrieve certificate chain.")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
